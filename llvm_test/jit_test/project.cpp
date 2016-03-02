@@ -3,6 +3,7 @@
 #include <iostream>
 #include <set>
 #include <vector>
+#include <map>
 
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/system_error.h"
@@ -45,16 +46,6 @@ int main(int argc, char **argv)
 	Function* func = mdl->getFunction("main");
 
 	unsigned inst_no = 0;	//作为函数中指令的编号，从1起为第一条指令。编号用于判断那个间接分支是已经分析过的
-//	unsigned inst_num;
-
-//	map<unsigned, Module*> indirect_branch_to_module_set;
-//	map<unsigned, set<Value*> > indirect_branch_to_associate_value_set_set;
-	//统计下指令数并初始化not_delete
-//	for(auto inst_iter = inst_begin(func); inst_iter != inst_end(func); ++inst_iter)
-//	{
-//		++inst_num;
-//	}
-//	vector<bool> not_move(inst_num+1, false);
 
 	//遍历指令，查找间接分支(先只找间接call)，并clone module
 	for(auto inst_iter = inst_begin(func); inst_iter != inst_end(func); ++inst_iter)
@@ -125,6 +116,8 @@ Instruction* map_inst_copy(Function* func, unsigned inst_no)		//返回func中第
 	return NULL;
 }
 
+void update_succ_bb(BasicBlock* bb);
+
 void update_function(Function* func, Instruction* inst)
 {
 	cerr << "================" << endl;
@@ -141,7 +134,7 @@ void update_function(Function* func, Instruction* inst)
 		associate_value_set.insert(inst->getOperand(i));
 	}
 	
-	//将inst本身标记为要移除，删减指令，最后将要移除的指令移到unreach_bb
+	//将inst本身标记为要移除，...，最后将要移除的指令移到unreach_bb
 	bool update_associate = false;
 	set<Instruction*> notMove_set;	//在该set中表示为已分析过且不移除(除了第一个加入的间接分支)，不在该set中则表示需要分析
 	notMove_set.insert(inst);
@@ -184,6 +177,17 @@ next:		//到了这里，说明指令本身或opr在关联集，将指令本身�
 			}
 		}
 	}while(update_associate);
+
+	//移除指令前，先保存CFG
+	map<BasicBlock*, set<BasicBlock*> > bb_predBbSet_set;
+	map<BasicBlock*, set<BasicBlock*> > bb_succBbSet_set;
+	for(auto bb_iter = func->begin(); bb_iter != func->end(); ++bb_iter)
+	{
+		for(auto pred_bb_iter = pred_begin(&*bb_iter); pred_bb_iter != pred_end(&*bb_iter); ++pred_bb_iter)
+			bb_predBbSet_set[&*bb_iter].insert(*pred_bb_iter);
+		for(auto succ_bb_iter = succ_begin(&*bb_iter); succ_bb_iter != succ_end(&*bb_iter); ++succ_bb_iter)
+			bb_succBbSet_set[&*bb_iter].insert(*succ_bb_iter);
+	}
 	
 	//移除标记完毕，现在开始移除。创建unreach_bb，把要移除的指令放到这里
 	BasicBlock* unreach_bb = BasicBlock::Create(getGlobalContext(), "unreach_bb", func);
@@ -221,104 +225,44 @@ next:		//到了这里，说明指令本身或opr在关联集，将指令本身�
 	cerr << "==============" << endl;
 	func->dump();
 
-}
-
-/*
-
-		if(inst_iter->getOpcode() == Instruction::Call)
+	//删除多余bb(即内容是空的)
+	for(auto bb_iter = func->begin(); bb_iter != func->end(); ++bb_iter)
+	{
+		bb_iter->dump();
+		if(!bb_iter->empty())
+			update_succ_bb(&*bb_iter, bb_predBbSet_set, bb_succBbSet_set);
+/*		if(bb_iter->empty())
 		{
-			if(CallInst* call_inst = dyn_cast<CallInst>(&*inst_iter))
+			cerr << "is's empty" << endl;
+			//将该bb的后继bb置为前驱bb的后继bb，并从前驱bb中删除该bb
+			for(auto pred_bb_iter = bb_predBbSet_set[&*bb_iter].begin(); pred_bb_iter != bb_predBbSet_set[&*bb_iter].end(); ++pred_bb_iter)
 			{
-				if(call_inst->getCalledFunction()==NULL)
+				bb_succBbSet_set[*pred_bb_iter].erase(&*bb_iter);
+				for(auto succ_bb_iter = bb_succBbSet_set[&*bb_iter].begin(); succ_bb_iter != bb_succBbSet_set[&*bb_iter].end(); ++succ_bb_iter)
 				{
-					//indirect_branch_module_set[no_inst] = CloneModule(mdl);
-					Module* mdl_copy = CloneModule(mdl);
-					//在module copy中找到这条间接分支
-					unsigned no_inst_copy = 0;
-					set<Value*> associate_val_set;
-					vector<bool> not_delete_copy(not_delete);
-					Function* func_copy = mdl_copy->getFunction("main");
-					for(auto inst_copy_iter = inst_begin(func_copy); inst_copy_iter != inst_end(func_copy); ++inst_copy_iter)
-					{
-						++no_inst_copy;
-						if(no_inst_copy!=no_inst)
-							continue;
-						//找到module copy中的间接分支了，现在收集关联value然后删减指令吧
-						if(CallInst* call_inst_copy = dyn_cast<CallInst>(&*inst_copy_iter))
-						{
-							associate_val_set.insert(call_inst_copy->getCalledValue());
-//							call_inst_copy->getCalledValue()->dump();
-							not_delete_copy[no_inst_copy] = true;
-							bool update_associate;
-							do{
-								update_associate = false;
-								no_inst_copy = 0;
-								for(auto inst_tmp_iter = inst_begin(func_copy); inst_tmp_iter != inst_end(func_copy); ++inst_tmp_iter)
-								{
-									++no_inst_copy;
-									if(not_delete_copy[no_inst_copy])	//为true表示不删表示已分析过
-										continue;
-									//判断指令本身或opr是否在关联集，是就将该指令标记为不可删，且用指令本身和指令的opr更新关联集
-									if(associate_val_set.find(&*inst_tmp_iter)==associate_val_set.end())	//如果该指令本身不在关联集，就判断其操作数在不在关联集
-									{
-										for(unsigned i = 0, num_opr = inst_tmp_iter->getNumOperands(); i < num_opr; ++i)
-										{
-											if(associate_val_set.find(inst_tmp_iter->getOperand(i))!=associate_val_set.end())
-											goto next;
-										}
-										continue;	//如果指令本身不在关联集且opr也都不在关联集，则遍历下一条指令
-									}
-next:								//到了这里，说明指令本身或opr在关联集，将指令本身和opr加进关联集
-									cerr << "meet inst: " << endl;
-									inst_tmp_iter->dump();
-									not_delete_copy[no_inst_copy] = true;
-									if(associate_val_set.insert(&*inst_tmp_iter).second)
-									{
-										cerr << "add inst into associate: " << endl;
-										inst_tmp_iter->dump();
-										update_associate = true;
-									}
-									for(unsigned i = 0, num_opr = inst_tmp_iter->getNumOperands(); i < num_opr; ++i)
-									{
-										if(isa<Constant>(inst_tmp_iter->getOperand(i))||isa<BasicBlock>(inst_tmp_iter->getOperand(i)))
-											continue;
-										if(associate_val_set.insert(inst_tmp_iter->getOperand(i)).second)
-										{
-											cerr << "add inst's opr into associate: " << endl;
-											inst_tmp_iter->getOperand(i)->dump();
-											update_associate = true;
-										}
-									}
-								}
-							}while(update_associate);
-							//到了这里，说明module copy已经删减标记完毕，现在是真的删减了
-							no_inst_copy = 0;
-							Instruction* will_del_inst = 0;
-							for(auto inst_tmp_iter = inst_begin(func_copy); inst_tmp_iter != inst_end(func_copy); ++inst_tmp_iter)
-							{
-								if(will_del_inst)
-								{
-									cerr << "will delete: " << endl;
-									will_del_inst->dump();
-									will_del_inst->removeFromParent();
-									will_del_inst = 0;
-								}
-								++no_inst_copy;
-								if(!not_delete_copy[no_inst_copy])
-								{
-									will_del_inst = &*inst_tmp_iter;
-								}
-							}
-							cerr << "=====" << endl;
-							func_copy->dump();
-						}
-						else
-							errx(-1, "Really?\n");
-
-					}
+					bb_succBbSet_set[*pred_bb_iter].insert(*succ_bb_iter);
 				}
 			}
-			else
-				errx(-1, "Really?\n");
 		}
-*/
+*/	}
+	cerr << "#############" << endl;
+	for(auto bb_iter = func->begin(); bb_iter != func->end(); ++bb_iter)
+	{
+		cerr << "=======" << endl;
+		bb_iter->dump();
+		cerr << "pred bb: " << endl;
+		for(auto pred_bb_iter = bb_predBbSet_set[&*bb_iter].begin(); pred_bb_iter != bb_predBbSet_set[&*bb_iter].end(); ++pred_bb_iter)
+		{
+			(*pred_bb_iter)->dump();
+		}
+		cerr << "succ bb: " << endl;
+		for(auto succ_bb_iter = bb_succBbSet_set[&*bb_iter].begin(); succ_bb_iter != bb_succBbSet_set[&*bb_iter].end(); ++succ_bb_iter)
+		{
+			(*succ_bb_iter)->dump();
+		}
+	}
+}
+
+void update_succ_bb(BasicBlock* bb, map<BasicBlock*, set<BasicBlock*> > bb_predBbSet_set, map<BasicBlock*, set<BasicBlock*> > bb_succBbSet_set)
+{
+	//遍历后继基本块，如果不是空的，就把该后继bb前驱bb的后继bb集中；如果后继bb是空的，就把后继bb的后继放到前驱bb的后继bb集中
